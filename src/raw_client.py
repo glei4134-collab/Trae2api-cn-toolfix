@@ -2819,6 +2819,7 @@ def build_runtime_system_prompt(
         "Caller client context (JSON):",
         json.dumps(context, ensure_ascii=False, separators=(",", ":"), sort_keys=True, default=str),
         "Discover the local environment through the available client tools when the request requires it.",
+        "Environment facts and execution results may only come from a client tool result in this conversation. If no tool result provided a fact, do not state it.",
         "If a tool can answer the question, call it proactively and wait for the external client result.",
         "Remote or server-side tools cannot write into the caller workspace. Never claim that a client file was downloaded, created, edited, patched, or saved unless a later matching client tool result with the same call id confirms success.",
         "A tool request, emitted tool-call block, plan, or assistant narration is not execution proof. If the matching client result reports failure, state the failure or request a corrective client tool; never report the operation as completed.",
@@ -2872,6 +2873,30 @@ def build_runtime_system_prompt(
     elif not tool_defs:
         lines.append("No client tools are available for this request; answer directly.")
 
+    if tool_defs:
+        lines.append(
+            "Tool arguments must be a JSON object of concrete values. Never use "
+            "placeholders such as \"...\", \"…\", [\"Ellipsis\"], \"<value>\", or "
+            "a made-up stand-in when a real value is required: read the file, "
+            "inspect the workspace, or call a discovery tool first."
+        )
+        lines.append(
+            "If a client tool result reports INVALID_ARGS, invalid arguments, or a "
+            "missing required property, retry the same tool immediately with every "
+            "required field and concrete values. An argument error is never evidence "
+            "that the tool or the environment is unavailable."
+        )
+        shell_names = {"pwsh", "powershell", "bash", "shell", "terminal", "cmd"}
+        if any(
+            str(tool.get("name") or "").strip().lower() in shell_names
+            for tool in tool_defs
+        ):
+            lines.append(
+                "For pwsh/powershell/shell tools, \"justification\" is only valid "
+                "together with \"sandbox_permissions\". Omit both when no escalation "
+                "is needed; never send \"justification\" alone."
+            )
+
     if tool_choice == "none":
         lines.append("Tool choice is none: do not request a tool.")
     elif tool_choice == "required":
@@ -2889,6 +2914,46 @@ def build_runtime_system_prompt(
     if style:
         lines.append(style)
     return "\n".join(lines)
+
+
+_TOOL_ARGUMENT_ERROR_MARKERS = (
+    "invalid arguments",
+    "invalid_args",
+    "missing required property",
+    "missing required parameter",
+    "arguments must be an object",
+    "invalid escalation",
+)
+
+
+def _tool_argument_error_in_messages(messages: Any) -> bool:
+    """Whether the newest client tool result is an argument/schema error."""
+
+    for message in reversed(messages or []):
+        if not isinstance(message, Mapping):
+            continue
+        role = str(message.get("role") or "").strip().lower()
+        if role not in {"tool", "function"}:
+            continue
+        text = _content_to_text(message.get("content")).lower()
+        if not text:
+            return False
+        return any(marker in text for marker in _TOOL_ARGUMENT_ERROR_MARKERS)
+    return False
+
+
+def tool_retry_directive(messages: Any) -> str:
+    """Return a retry nudge when the last client tool call failed on arguments."""
+
+    if not _tool_argument_error_in_messages(messages):
+        return ""
+    return (
+        "Retry directive: the most recent client tool result is an argument/schema "
+        "error. Immediately re-issue the same tool with every required property and "
+        "concrete values. That error is not evidence about the environment or tool "
+        "availability: do not describe the runtime, do not claim the tool is "
+        "unavailable, and do not answer with a diagnostic report instead of the retry."
+    )
 
 
 def _raw_history_limit(
@@ -3397,6 +3462,9 @@ def build_raw_messages(
                 "necessary tool call with different arguments; do not repeat "
                 "the completed call."
             )
+        retry_directive = tool_retry_directive(messages)
+        if retry_directive:
+            runtime_prompt += "\n" + retry_directive
         result.append(
             {"role": "system", "content": [{"type": "text", "text": runtime_prompt}]}
         )

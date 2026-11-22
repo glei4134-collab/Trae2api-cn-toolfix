@@ -98,6 +98,7 @@ from .sse import (
     translate_cli_stream,
     translate_ide_stream,
     translate_web_events,
+    web_fetch_url_hints,
 )
 from .token_usage import usage_details
 from .session_usage import enrich_remote_events, legacy_usage_enricher
@@ -667,6 +668,7 @@ PUBLIC_PATHS = {
     "/v1/models",
     "/models",
     "/web/login",
+    "/web/key",
     "/web/login/download",
     "/web/login/helper-info",
     "/authorize",
@@ -2289,6 +2291,12 @@ def _web_login_html() -> str:
 
 <div class="tab-page" data-page="settings">
 <div class="panel-grid cols-2">
+<div class="panel-card">
+  <div class="section-head"><div class="section-title">API 接入</div></div>
+  <p class="field-note">查看 Base URL 与 API Key，用于 DSH 或其它 OpenAI 兼容客户端。</p>
+  <div class="btn-group"><a class="btn btn-ghost btn-sm" href="/web/key" target="_blank" rel="noopener">打开接入信息页</a></div>
+</div>
+
 <div class="panel-card">
   <div class="section-head"><div class="section-title">多账号轮询</div></div>
   <div class="switch-row">
@@ -8561,7 +8569,9 @@ async def run_cli_chat(messages, model, stream: bool, options: Optional[dict] = 
 
 async def _await_session_cleanup(task: asyncio.Task) -> None:
     """Finish owned cleanup before propagating repeated client cancellation."""
-    pending_exception = sys.exception()
+    pending_exception = (
+        sys.exception() if hasattr(sys, "exception") else sys.exc_info()[1]
+    )
     cancellation = (
         pending_exception if isinstance(pending_exception, asyncio.CancelledError) else None
     )
@@ -9648,6 +9658,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                         usage_enricher=legacy_usage_enricher(
                             current_wrapper, upstream_metadata
                         ),
+                        url_hints=web_fetch_url_hints(messages),
                         **translation_options,
                     ):
                         if (
@@ -9710,6 +9721,7 @@ async def run_ide_chat(messages, model, stream: bool, options: Optional[dict] = 
                 usage_enricher=legacy_usage_enricher(
                     response_wrapper, upstream_metadata
                 ),
+                url_hints=web_fetch_url_hints(messages),
                 **translation_options,
             )
             _bind_usage_turn_from_metadata(upstream_metadata)
@@ -9816,6 +9828,7 @@ async def run_traework_native_chat(
                     FORWARD_USAGE,
                     fail_on_empty=True,
                     upstream_metadata=upstream_metadata,
+                    url_hints=web_fetch_url_hints(messages),
                     **translation_options,
                 ):
                     _bind_usage_turn_from_metadata(upstream_metadata)
@@ -9839,6 +9852,7 @@ async def run_traework_native_chat(
             model,
             fail_on_empty=True,
             upstream_metadata=upstream_metadata,
+            url_hints=web_fetch_url_hints(messages),
             **translation_options,
         )
         _bind_usage_turn_from_metadata(upstream_metadata)
@@ -9899,6 +9913,7 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                             fail_on_empty=True,
                             require_terminal=False,
                             upstream_metadata=upstream_metadata,
+                            url_hints=web_fetch_url_hints(messages),
                             **translation_options,
                         ):
                             _bind_usage_turn_from_metadata(upstream_metadata)
@@ -9989,6 +10004,7 @@ async def run_raw_chat(messages, model, stream: bool, options: Optional[dict] = 
                 fail_on_empty=True,
                 require_terminal=False,
                 upstream_metadata=upstream_metadata,
+                url_hints=web_fetch_url_hints(messages),
                 **translation_options,
             )
             _bind_usage_turn_from_metadata(upstream_metadata)
@@ -14043,6 +14059,43 @@ app = FastAPI(title="Trae CN Relay", version=APP_VERSION, lifespan=lifespan)
 @app.exception_handler(_ModelAccountUnavailable)
 async def model_account_unavailable_handler(_request: Request, exc: _ModelAccountUnavailable):
     return _openai_error(503, str(exc), "model_account_unavailable")
+
+
+@app.get("/web/key", response_class=HTMLResponse)
+async def web_key_page(request: Request):
+    """接入信息页：显示 Base URL 与 RELAY_API_KEYS（受 nginx Basic Auth 保护）。"""
+    scheme = str(request.headers.get("x-forwarded-proto") or "https").split(",")[0].strip() or "https"
+    host = str(request.headers.get("host") or "").strip() or "relay.example.com:8443"
+    base_url = f"{scheme}://{host}/v1"
+    keys = [k for k in globals().get("API_KEYS", []) if k]
+    if keys:
+        items = "".join(
+            '<input readonly value="%s" onclick="this.select()" '
+            'style="width:100%%;padding:9px 10px;font-family:ui-monospace,Consolas,monospace;'
+            'border:1px solid #d1d5db;border-radius:6px;margin:6px 0;background:#f9fafb">' % k
+            for k in keys
+        )
+    else:
+        items = '<p style="color:#b91c1c">未配置 RELAY_API_KEYS</p>'
+    doc = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API 接入信息</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:760px;margin:48px auto;padding:0 18px;color:#111827;background:#fff}
+h2{margin:0 0 6px;font-size:20px}
+.sub{color:#6b7280;font-size:13px;margin-bottom:22px}
+.card{border:1px solid #e5e7eb;border-radius:10px;padding:16px 18px;margin:14px 0;background:#fff}
+.label{font-weight:600;font-size:13px;color:#374151;margin-bottom:8px}
+.warn{margin-top:24px;padding:12px 14px;border-left:3px solid #f59e0b;background:#fffbeb;color:#92400e;font-size:13px;border-radius:4px}
+</style></head><body>
+<h2>API 接入信息</h2>
+<div class="sub">OpenAI 兼容端点，点击输入框可全选复制</div>
+<div class="card"><div class="label">Base URL</div>
+<input readonly value="%s" onclick="this.select()" style="width:100%%;padding:9px 10px;font-family:ui-monospace,Consolas,monospace;border:1px solid #d1d5db;border-radius:6px;background:#f9fafb"></div>
+<div class="card"><div class="label">API Key</div>%s</div>
+<div class="warn">此页面仅通过 Basic Auth 保护。Key 泄露等于接口被白嫖，请勿截图或转发。</div>
+</body></html>""" % (base_url, items)
+    return HTMLResponse(doc)
 
 
 @app.get("/api/overview")

@@ -12,6 +12,7 @@ import os
 import re
 import time
 import uuid
+from urllib.parse import urlsplit
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Optional
 
 from . import auth
@@ -1581,8 +1582,84 @@ def _split_json_stream(text: str):
     return out
 
 
+def web_fetch_url_hints(messages: Any) -> list[str]:
+    """Collect URLs from earlier client fetch calls in the request history."""
+
+    hints: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, Mapping):
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, Mapping):
+                continue
+            function = call.get("function")
+            function = function if isinstance(function, Mapping) else {}
+            name = str(function.get("name") or "").lower()
+            if "fetch" not in name and "http" not in name:
+                continue
+            arguments = function.get("arguments")
+            try:
+                payload = json.loads(arguments) if isinstance(arguments, str) else arguments
+            except (TypeError, ValueError):
+                continue
+            url = payload.get("url") if isinstance(payload, Mapping) else None
+            if isinstance(url, str) and url.strip():
+                hints.append(url.strip())
+    return hints[-8:]
+
+
+def _recover_web_fetch_url(
+    name: Any, arguments: Any, url_hints: Optional[list[str]]
+) -> str:
+    """Rebuild a truncated web_fetch URL from a host seen earlier in the turn.
+
+    Trae's native delta stream occasionally starts mid-URL, e.g. the tail
+    ``f.cyberzerk.fr/reglement`` for ``https://ctf.cyberzerk.fr/reglement``.
+    The full host is present in a previous fetch call, so match the tail
+    against that host instead of dropping the whole turn.
+    """
+
+    tool_name = str(name or "").lower()
+    if "fetch" not in tool_name and "http" not in tool_name:
+        return ""
+    tail = str(arguments or "").strip().rstrip("}").rstrip('"').strip()
+    if not tail or tail.startswith("{") or "/" not in tail:
+        return ""
+    tail_host, _, tail_path = tail.partition("/")
+    if not tail_host or not tail_path or "." not in tail_host:
+        return ""
+    for hint in reversed(url_hints or []):
+        try:
+            parts = urlsplit(hint)
+        except ValueError:
+            continue
+        host = (parts.hostname or "").lower()
+        if not host:
+            continue
+        lowered_tail_host = tail_host.lower()
+        # The stream can cut inside a label (``ctf`` -> ``f``), so allow a
+        # plain suffix match while still requiring a dotted host.
+        if host != lowered_tail_host and not host.endswith(lowered_tail_host):
+            continue
+        scheme = parts.scheme or "https"
+        candidate = f"{scheme}://{host}/{tail_path}"
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            continue
+        if parsed.scheme in {"http", "https"} and parsed.hostname:
+            return json.dumps(
+                {"url": candidate}, ensure_ascii=False, separators=(",", ":")
+            )
+    return ""
+
+
 def _ensure_native_tool_arguments(
-    calls: list[dict], usage: Any = None, *, strict: bool = False
+    calls: list[dict],
+    usage: Any = None,
+    *,
+    strict: bool = False,
+    url_hints: Optional[list[str]] = None,
 ) -> list[dict]:
     """Validate/repair/split malformed native delta tool arguments."""
     repaired_any = False
@@ -1645,6 +1722,20 @@ def _ensure_native_tool_arguments(
                 continue
             except Exception:
                 pass
+        recovered_url = _recover_web_fetch_url(
+            function.get("name"), arguments, url_hints
+        )
+        if recovered_url:
+            function["arguments"] = recovered_url
+            repaired_any = True
+            logger.warning(
+                "[repair-url] call=%s %r -> %s",
+                function.get("name") or "?",
+                str(arguments)[:80],
+                recovered_url,
+            )
+            kept.append(call)
+            continue
         stripped = arguments.strip()
         if stripped in ("}", "]", "", "{}", "[]"):
             logger.warning("[drop] orphan closing fragment %r", stripped[:30])
@@ -2208,6 +2299,7 @@ async def translate_ide_stream(
     upstream_metadata: Optional[dict] = None,
     include_reasoning: bool = False,
     usage_enricher: Optional[Callable[[Optional[dict]], Awaitable[Optional[dict]]]] = None,
+    url_hints: Optional[list[str]] = None,
 ):
     """Translate /api/ide chat or llm_raw_chat SSE into OpenAI SSE."""
     prefix_id = make_id()
@@ -2436,7 +2528,10 @@ async def translate_ide_stream(
         )
     tool_calls.set_calls(
         _ensure_native_tool_arguments(
-            tool_calls.calls(), final_usage, strict=True
+            tool_calls.calls(),
+            final_usage,
+            strict=True,
+            url_hints=url_hints,
         )
     )
     if reasoning_summary:
@@ -3606,6 +3701,7 @@ async def collect_nonstream_ide(
     upstream_metadata: Optional[dict] = None,
     include_reasoning: bool = False,
     usage_enricher: Optional[Callable[[Optional[dict]], Awaitable[Optional[dict]]]] = None,
+    url_hints: Optional[list[str]] = None,
 ) -> dict:
     prefix_id = make_id()
     full = ""
@@ -3755,7 +3851,12 @@ async def collect_nonstream_ide(
             observed_model_event=observed_model_event,
         )
     tool_calls.set_calls(
-        _ensure_native_tool_arguments(tool_calls.calls(), usage, strict=True)
+        _ensure_native_tool_arguments(
+            tool_calls.calls(),
+            usage,
+            strict=True,
+            url_hints=url_hints,
+        )
     )
     if not full.strip() and not tool_calls.has_calls and saw_completed_repeat:
         raise RepeatedCompletedToolResponse(
