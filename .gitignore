@@ -1,5 +1,6 @@
 # Runtime state and credentials
 /.env
+/.env.bak-*
 /.env.local
 /.enterprise-probe.env
 /data/
