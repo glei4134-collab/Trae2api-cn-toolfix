@@ -4457,6 +4457,19 @@ def _catalog_endpoints(config: Mapping[str, Any]) -> list[str]:
     return result
 
 
+def _catalog_max_descriptor(
+    model_name: str, config: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    """Apply operator-pinned Max limits when the catalog omits output caps."""
+
+    try:
+        from . import trae_remote_client
+
+        return trae_remote_client._effective_max_model(model_name, config)
+    except Exception:
+        return config
+
+
 def _max_variant_endpoints(
     config: Mapping[str, Any], endpoints: list[str]
 ) -> list[str]:
@@ -4636,10 +4649,13 @@ async def get_models(force: bool = False) -> list[dict]:
                     capabilities_by_scope=capabilities_by_scope,
                     metadata=metadata,
                 )
-            max_profile = descriptor_max_profile(config)
+            max_descriptor = _catalog_max_descriptor(exact, config)
+            max_profile = descriptor_max_profile(max_descriptor)
             max_endpoints = _max_variant_endpoints(config, endpoints)
             if max_profile and max_endpoints and not exact.lower().endswith("-max"):
-                max_metadata = _public_model_metadata(config, max_variant=True)
+                max_metadata = _public_model_metadata(
+                    max_descriptor, max_variant=True
+                )
                 max_exact = exact + "-max"
                 _merge_model_item(
                     items_by_id,

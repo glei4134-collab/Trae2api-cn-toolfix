@@ -896,7 +896,62 @@ def _max_mode_requested(
         if not values.intersection(configured):
             return False
     # Never fabricate max limits for a model the account config does not mark.
-    return descriptor_supports_max_mode(custom_model)
+    return descriptor_supports_max_mode(
+        _effective_max_model(model_name, custom_model)
+    )
+
+
+def _max_mode_override(model_name: str) -> dict[str, Any]:
+    """Return verified max-profile limits pinned through the environment."""
+
+    raw = os.environ.get("TRAE_MAX_MODE_OVERRIDE", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    if not isinstance(data, Mapping):
+        return {}
+    base, _max_variant = trae_client.split_max_model_name(model_name)
+    for key in (
+        str(model_name or "").strip(),
+        str(model_name or "").strip().lower(),
+        str(base or "").strip(),
+        str(base or "").strip().lower(),
+    ):
+        value = data.get(key)
+        if isinstance(value, Mapping):
+            return dict(value)
+    return {}
+
+
+def _effective_max_model(
+    model_name: str, custom_model: Optional[Mapping[str, Any]]
+) -> dict[str, Any]:
+    """Merge verified max-profile limits into the live descriptor."""
+
+    model = dict(custom_model or {})
+    override = _max_mode_override(model_name)
+    if not override:
+        return model
+    try:
+        context_value = int(override.get("context_window_size") or 0)
+    except (TypeError, ValueError):
+        context_value = 0
+    if context_value > 0:
+        # Keep the catalog's dev window authoritative; setting a 1M default
+        # here would make the dev/max comparison collapse and disable Max.
+        model["context_window_size"] = {"max": [context_value]}
+        model["max_mode"] = True
+    for key in ("prompt_max_tokens", "max_tokens"):
+        try:
+            value = int(override.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            model[key] = value
+    return model
 
 
 def _max_mode_custom_model(custom_model: Mapping[str, Any]) -> dict[str, Any]:
@@ -1053,7 +1108,9 @@ async def create_session(
         )
         initial_message["custom_model"] = custom_model
     if max_requested:
-        max_custom_model = _max_mode_custom_model(custom_model)
+        max_custom_model = _max_mode_custom_model(
+            _effective_max_model(model, custom_model)
+        )
         initial_message["custom_model"] = max_custom_model
         initial_message.update(_max_mode_fields(max_custom_model, options))
     max_trace = (options or {}).get("_upstream_trace")

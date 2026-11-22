@@ -493,6 +493,12 @@ def _check_provider_model(requested: str, actual: str) -> None:
         effective_requested = convert_model_name(str(requested or "")) or requested
     except Exception:
         pass
+    try:
+        from .trae_client import split_max_model_name
+
+        effective_requested, _max_variant = split_max_model_name(effective_requested)
+    except Exception:
+        pass
     requested_family = _model_family(effective_requested)
     if requested_family in {"", "auto", "work", "auto-work", "solo-work"}:
         return

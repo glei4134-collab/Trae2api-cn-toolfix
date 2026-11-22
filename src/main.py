@@ -4220,22 +4220,23 @@ async function detectMaxModels(){{
   var out=document.getElementById('max-mode-models-out');
   btn.disabled=true;
   try{{
-    var result=await requestJSON('/api/max-mode/models',{{method:'GET'}},45000);
+    var result=await requestJSON('/api/max-mode/models?all=true',{{method:'GET'}},50000);
     var d=result.data;
     if(!result.ok||!d||!d.success) throw new Error(apiError(d,result.status));
     out.textContent='';
     var list=d.models||[];
-    if(!list.length) out.textContent='当前账号没有支持 Max 的模型';
+    if(!list.length) out.textContent='所有账号都没有支持 Max 的模型';
     list.forEach(function(m){{
       var chip=document.createElement('button');
       chip.type='button';
       chip.className='model-chip';
-      chip.textContent=m.name+(m.max_context?' · '+formatContext(m.max_context):'');
+      chip.textContent=m.name+(m.max_context?' · '+formatContext(m.max_context):'')+(m.account_count?' · '+m.account_count+' 个账号':'');
       chip.title='加入生效模型';
       chip.onclick=function(){{ addMaxModel(m.name); }};
       out.appendChild(chip);
     }});
     out.hidden=false;
+    if(d.accounts_failed>0) showMsg('max-mode-msg','有 '+d.accounts_failed+' 个账号目录获取失败，结果可能不完整',true,6000);
   }}catch(e){{ showMsg('max-mode-msg',String(e),false,8000); }}
   finally{{ btn.disabled=false; }}
 }}
@@ -16260,11 +16261,132 @@ def _max_context_of(config: Mapping[str, Any]) -> int:
     return descriptor_max_context(config) or 0
 
 
+_MAX_MODELS_SCAN_TTL = 300.0
+_MAX_MODELS_SCAN_CACHE: dict[str, Any] = {"key": "", "at": 0.0, "payload": {}}
+
+
+async def _scan_account_max_models(account_id: str) -> tuple[str, dict[str, dict], bool]:
+    """Fetch one account's Agent catalog and keep its max-capable models."""
+
+    record = auth.get_account_record(account_id)
+    token = str(record.get("token") or "").strip()
+    if not token:
+        return account_id, {}, False
+    provider = record.get("provider_specific") or record.get("providerSpecificData")
+    try:
+        configs = await asyncio.wait_for(
+            trae_client._fetch_web_model_configs(
+                token_override=token,
+                provider_specific=(
+                    dict(provider) if isinstance(provider, Mapping) else None
+                ),
+                agent_type="solo_agent_remote",
+            ),
+            timeout=15,
+        )
+    except Exception as exc:
+        logger.warning("max-mode scan account=%s failed: %s", account_id, exc)
+        return account_id, {}, False
+    if not isinstance(configs, Mapping):
+        return account_id, {}, False
+    capable: dict[str, dict] = {}
+    for name, cfg in configs.items():
+        if not isinstance(cfg, Mapping):
+            continue
+        effective = trae_remote_client._effective_max_model(name, cfg)
+        if descriptor_supports_max_mode(effective):
+            capable[name] = effective
+    return account_id, capable, bool(configs)
+
+
 @app.get("/api/max-mode/models")
-async def api_max_mode_models():
-    """List Agent-tier models the active account marks with ``max_mode``."""
+async def api_max_mode_models(
+    scan_all: bool = Query(False, alias="all"),
+    refresh: bool = Query(False),
+):
+    """List max-capable models; ``all=1`` scans the whole account pool."""
 
     account_id, record = auth.get_active_account_snapshot()
+    if scan_all:
+        accounts = [
+            item for item in auth.list_accounts() if item.get("has_token")
+        ]
+        account_ids = [
+            str(item.get("id") or "") for item in accounts if item.get("id")
+        ]
+        cache_key = ",".join(sorted(account_ids))
+        now = time.time()
+        cached = _MAX_MODELS_SCAN_CACHE
+        if (
+            not refresh
+            and cache_key
+            and cached.get("key") == cache_key
+            and now - float(cached.get("at") or 0) <= _MAX_MODELS_SCAN_TTL
+        ):
+            payload = dict(cached.get("payload") or {})
+            payload["cached"] = True
+            return JSONResponse(payload)
+        if account_ids:
+            semaphore = asyncio.Semaphore(6)
+
+            async def scan_one(item_id: str):
+                async with semaphore:
+                    return await _scan_account_max_models(item_id)
+
+            results = await asyncio.gather(
+                *(scan_one(item_id) for item_id in account_ids),
+                return_exceptions=True,
+            )
+            merged: dict[str, dict] = {}
+            scanned = ok = failed = 0
+            for result in results:
+                if isinstance(result, Exception):
+                    failed += 1
+                    continue
+                _item_id, capable, fetched = result
+                scanned += 1
+                if fetched:
+                    ok += 1
+                else:
+                    failed += 1
+                for name, cfg in capable.items():
+                    entry = merged.setdefault(
+                        name,
+                        {
+                            "name": name,
+                            "display_name": str(cfg.get("display_name") or name),
+                            "max_context": 0,
+                            "account_count": 0,
+                        },
+                    )
+                    entry["max_context"] = max(
+                        int(entry.get("max_context") or 0), _max_context_of(cfg)
+                    )
+                    entry["account_count"] = int(
+                        entry.get("account_count") or 0
+                    ) + 1
+            models = sorted(
+                merged.values(), key=lambda entry: str(entry["name"]).lower()
+            )
+            if not ok:
+                return JSONResponse(
+                    {"success": False, "error": "上游模型列表获取失败"},
+                    status_code=502,
+                )
+            payload = {
+                "success": True,
+                "account_id": account_id,
+                "models": models,
+                "accounts_scanned": scanned,
+                "accounts_ok": ok,
+                "accounts_failed": failed,
+                "cached": False,
+                "scanned_at": now,
+            }
+            _MAX_MODELS_SCAN_CACHE.update(
+                {"key": cache_key, "at": now, "payload": dict(payload)}
+            )
+            return JSONResponse(payload)
     token = str((record or {}).get("token") or "") or str(auth.get_token() or "")
     if not token:
         return JSONResponse({"success": False, "error": "没有可用账号"}, status_code=400)
