@@ -1660,6 +1660,49 @@ def _recover_web_fetch_url(
     return ""
 
 
+_HEADLESS_PATH_TOOLS = {
+    "read",
+    "write",
+    "edit",
+    "view",
+    "ls",
+    "list",
+    "glob",
+    "grep",
+    "cat",
+    "open",
+}
+
+
+def _recover_headless_path_arguments(name: Any, arguments: Any) -> str:
+    """Rebuild a path-only argument tail whose JSON prefix was lost.
+
+    The legacy ``llm_utils_chat`` adapter can deliver one argument snapshot
+    without its ``{"path": "`` prefix.  A bare path tail is still useful: the
+    client will execute it and return "not found", letting the model correct
+    the path instead of aborting the whole turn with 4001-style invalid JSON.
+    """
+
+    tool_name = str(name or "").strip().lower()
+    if tool_name not in _HEADLESS_PATH_TOOLS:
+        return ""
+    text = str(arguments or "").strip()
+    if not text or text[:1] in ("{", "["):
+        return ""
+    tail = text
+    if tail.endswith("}"):
+        tail = tail[:-1].rstrip()
+    if tail.endswith('"'):
+        tail = tail[:-1]
+    if not tail or not re.search(r"[\\/]", tail):
+        return ""
+    if re.search(r'["{}\[\]]', tail):
+        return ""
+    # Leave valid JSON escapes alone; double only lone Windows separators.
+    escaped = re.sub(r'(?<!\\)\\(?!["\\/bfnrtu])', r"\\\\", tail)
+    return json.dumps({"path": escaped}, ensure_ascii=False)
+
+
 def _ensure_native_tool_arguments(
     calls: list[dict],
     usage: Any = None,
@@ -1739,6 +1782,20 @@ def _ensure_native_tool_arguments(
                 function.get("name") or "?",
                 str(arguments)[:80],
                 recovered_url,
+            )
+            kept.append(call)
+            continue
+        recovered_path = _recover_headless_path_arguments(
+            function.get("name"), arguments
+        )
+        if recovered_path:
+            function["arguments"] = recovered_path
+            repaired_any = True
+            logger.warning(
+                "[repair-path] call=%s %r -> %s",
+                function.get("name") or "?",
+                str(arguments)[:80],
+                recovered_path,
             )
             kept.append(call)
             continue
