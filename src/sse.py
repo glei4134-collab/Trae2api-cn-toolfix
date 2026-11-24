@@ -1520,14 +1520,151 @@ class ToolCallAccumulator:
             self._indexes[key] = idx
 
 
-def _repair_json_arguments(arguments: str) -> str:
-    """Best-effort repair of a truncated native tool arguments string.
+_HEX_DIGITS = set("0123456789abcdefABCDEF")
+_SIMPLE_ESCAPES = set('"\\/bfnrt')
+_CONTROL_ESCAPES = {
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\b": "\\b",
+    "\f": "\\f",
+}
+_STRING_TERMINATORS = set(",}]:")
+_MUTATING_TOOL_NAMES = {
+    "pwsh", "powershell", "bash", "sh", "shell", "zsh",
+    "write", "edit", "apply_patch", "delete", "move", "rename",
+    "remove", "rm", "del", "run_command", "terminal", "exec",
+}
 
-    Trae's native stream occasionally drops the final fragment(s) of a tool
-    call, leaving arguments like ``{"command": "git status"`` without the
-    closing ``}`` (or with a dangling quote). Never raise on malformed input;
-    return the original string when we cannot repair confidently.
-    """
+
+def _sanitize_json_strings(text: str) -> str:
+    """Escape raw control bytes, lone backslashes, and unescaped inner quotes."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    while i < n:
+        ch = text[i]
+        if not in_str:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if (
+                nxt == "u"
+                and i + 6 <= n
+                and all(c in _HEX_DIGITS for c in text[i + 2 : i + 6])
+            ):
+                out.append(text[i : i + 6])
+                i += 6
+                continue
+            if nxt and nxt in _SIMPLE_ESCAPES:
+                out.append(text[i : i + 2])
+                i += 2
+                continue
+            out.append("\\\\")
+            i += 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in _STRING_TERMINATORS:
+                in_str = False
+                out.append(ch)
+            else:
+                out.append('\\"')
+            i += 1
+            continue
+        if ch < " ":
+            out.append(_CONTROL_ESCAPES.get(ch) or "\\u%04x" % ord(ch))
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _extract_json_span(text: str) -> str:
+    """Trim prose/fences around the outermost JSON value, if any."""
+    starts = [pos for pos in (text.find("{"), text.find("[")) if pos >= 0]
+    if not starts:
+        return text
+    start = min(starts)
+    end = max(text.rfind("}"), text.rfind("]"))
+    if end <= start:
+        return text[start:]
+    return text[start : end + 1]
+
+
+def _drop_trailing_commas(text: str) -> str:
+    """Remove commas that directly precede a closing brace/bracket."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _is_mutating_tool(name: Any) -> bool:
+    return str(name or "").strip().lower() in _MUTATING_TOOL_NAMES
+
+
+def _guard_mutating_repair(
+    name: Any,
+    finish_reason: Optional[str],
+    reason: str,
+    usage: Any,
+    strict: bool,
+) -> bool:
+    """Refuse to execute a repaired command when upstream hit the token limit."""
+    if not _is_mutating_tool(name) or str(finish_reason or "").lower() != "length":
+        return True
+    logger.warning(
+        "[tool-arg-guard] tool=%s reason=%s finish_reason=length; refusing partial command",
+        name or "?",
+        reason,
+    )
+    if strict:
+        raise InvalidNativeToolArguments(
+            "Trae upstream truncated arguments for mutating tool "
+            f"{name or '?'}; refusing to execute a partial command",
+            retryable=False,
+            usage=usage,
+            observed_model_event=True,
+        )
+    return False
+
+
+def _repair_json_arguments(arguments: str) -> str:
+    """Best-effort repair of a malformed native tool arguments string."""
     if not arguments:
         return arguments
     try:
@@ -1535,7 +1672,13 @@ def _repair_json_arguments(arguments: str) -> str:
         return arguments
     except Exception:
         pass
-    repaired = arguments.rstrip()
+    repaired = _extract_json_span(arguments.strip())
+    repaired = _drop_trailing_commas(_sanitize_json_strings(repaired))
+    try:
+        json.loads(repaired)
+        return repaired
+    except Exception:
+        pass
     stack = []
     in_str = False
     esc = False
@@ -1565,6 +1708,31 @@ def _repair_json_arguments(arguments: str) -> str:
         return repaired
     except Exception:
         return arguments
+
+
+def _log_unrepairable_arguments(name: str, arguments: str) -> None:
+    """Append the raw offending arguments when opt-in diagnosis is on."""
+    if os.environ.get("TRAE_DUMP_UNREPAIRABLE_TOOL_ARGS", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "data",
+            "tool-args-drops.log",
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                "%s\t%s\t%r\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), name, arguments[:4000])
+            )
+    except Exception:
+        pass
 
 
 def _split_json_stream(text: str):
@@ -1703,14 +1871,112 @@ def _recover_headless_path_arguments(name: Any, arguments: Any) -> str:
     return json.dumps({"path": escaped}, ensure_ascii=False)
 
 
+_SHELL_TOOL_NAMES = {
+    "pwsh", "powershell", "bash", "sh", "shell", "zsh",
+    "run_command", "run", "terminal", "exec", "execute_command",
+}
+
+
+def _overlap_join_arguments(head: str, tail: str) -> tuple[str, int]:
+    """Join two argument fragments that may overlap.
+
+    The upstream replay window can restart a few dozen characters before the
+    previous fragment ended, so a plain concatenation duplicates that span and
+    breaks JSON repair. Return the longest suffix of ``head`` that is also a
+    prefix of ``tail`` joined once.
+    """
+    limit = min(len(head), len(tail))
+    for size in range(limit, 0, -1):
+        if head[-size:] == tail[:size]:
+            return head + tail[size:], size
+    return head + tail, 0
+
+
+def _merge_split_argument_fragments(calls: list[dict]) -> list[dict]:
+    """Re-join a JSON head fragment and its body tail keyed as two calls.
+
+    The native stream occasionally keys the opening fragment (for example the
+    start of a command string) as one call and the remaining script body as a
+    second call with the same function name. Either half alone is invalid
+    JSON, which otherwise aborts the whole turn. Merge only when the head
+    opens a JSON object and the tail is a bare continuation whose
+    concatenation repairs to valid JSON.
+    """
+    if not isinstance(calls, list) or len(calls) < 2:
+        return calls
+    dropped: set[int] = set()
+    for head_index, head in enumerate(calls):
+        if head_index in dropped:
+            continue
+        head_function = head.get("function") or {}
+        head_args = head_function.get("arguments")
+        if not isinstance(head_args, str):
+            continue
+        head_text = head_args.strip()
+        if not head_text or head_text[:1] not in ("{", "["):
+            continue
+        try:
+            json.loads(head_text)
+            continue
+        except (TypeError, ValueError):
+            pass
+        name = str(head_function.get("name") or "")
+        if not name:
+            continue
+        for tail_index, tail in enumerate(calls):
+            if tail_index == head_index or tail_index in dropped:
+                continue
+            tail_function = tail.get("function") or {}
+            if str(tail_function.get("name") or "") != name:
+                continue
+            tail_args = tail_function.get("arguments")
+            if not isinstance(tail_args, str):
+                continue
+            tail_text = tail_args.strip()
+            if not tail_text or tail_text[:1] in ("{", "[", "}"):
+                continue
+            try:
+                json.loads(tail_text)
+                continue
+            except (TypeError, ValueError):
+                pass
+            joined, overlap = _overlap_join_arguments(head_args, tail_args)
+            combined = _repair_json_arguments(joined)
+            try:
+                json.loads(combined)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "[merge-fragment-fail] call=%s head=%r tail=%r",
+                    name,
+                    head_args[-80:],
+                    tail_args[:80],
+                )
+                continue
+            head_function["arguments"] = combined
+            dropped.add(tail_index)
+            logger.warning(
+                "[merge-fragment] call=%s joined %d+%d chars overlap=%d",
+                name,
+                len(head_args),
+                len(tail_args),
+                overlap,
+            )
+            break
+    if not dropped:
+        return calls
+    return [call for index, call in enumerate(calls) if index not in dropped]
+
+
 def _ensure_native_tool_arguments(
     calls: list[dict],
     usage: Any = None,
     *,
     strict: bool = False,
     url_hints: Optional[list[str]] = None,
+    finish_reason: Optional[str] = None,
 ) -> list[dict]:
     """Validate/repair/split malformed native delta tool arguments."""
+    calls = _merge_split_argument_fragments(calls)
     repaired_any = False
     kept: list[dict] = []
     for call in calls:
@@ -1726,6 +1992,23 @@ def _ensure_native_tool_arguments(
             continue
         except (TypeError, ValueError):
             pass
+        try:
+            parsed = json.loads(arguments, strict=False)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            if not _guard_mutating_repair(
+                function.get("name"), finish_reason, "control-char", usage, strict
+            ):
+                continue
+            function["arguments"] = json.dumps(parsed, ensure_ascii=False)
+            repaired_any = True
+            logger.warning(
+                "[repair] call=%s re-encoded raw control character(s)",
+                function.get("name") or "?",
+            )
+            kept.append(call)
+            continue
         parts = _split_json_stream(arguments)
         if parts is not None:
             if len(parts) > 1:
@@ -1759,6 +2042,10 @@ def _ensure_native_tool_arguments(
         if fixed != arguments:
             try:
                 json.loads(fixed)
+                if not _guard_mutating_repair(
+                    function.get("name"), finish_reason, "structured-repair", usage, strict
+                ):
+                    continue
                 function["arguments"] = fixed
                 repaired_any = True
                 logger.warning(
@@ -1771,6 +2058,38 @@ def _ensure_native_tool_arguments(
                 continue
             except Exception:
                 pass
+        if (
+            os.environ.get("TRAE_TOOL_ARGS_JSON_REPAIR", "").strip().lower()
+            in ("1", "true", "yes", "on")
+            and str(arguments).lstrip().startswith("{")
+        ):
+            try:
+                import json_repair as _json_repair
+            except Exception:
+                _json_repair = None
+            if _json_repair is not None:
+                try:
+                    repaired_value = _json_repair.loads(arguments, skip_json_loads=True)
+                except TypeError:
+                    try:
+                        repaired_value = _json_repair.loads(arguments)
+                    except Exception:
+                        repaired_value = None
+                except Exception:
+                    repaired_value = None
+                if isinstance(repaired_value, dict):
+                    if not _guard_mutating_repair(
+                        function.get("name"), finish_reason, "json-repair", usage, strict
+                    ):
+                        continue
+                    function["arguments"] = json.dumps(repaired_value, ensure_ascii=False)
+                    repaired_any = True
+                    logger.warning(
+                        "[repair-json-repair] call=%s",
+                        function.get("name") or "?",
+                    )
+                    kept.append(call)
+                    continue
         recovered_url = _recover_web_fetch_url(
             function.get("name"), arguments, url_hints
         )
@@ -1789,6 +2108,10 @@ def _ensure_native_tool_arguments(
             function.get("name"), arguments
         )
         if recovered_path:
+            if not _guard_mutating_repair(
+                function.get("name"), finish_reason, "path-repair", usage, strict
+            ):
+                continue
             function["arguments"] = recovered_path
             repaired_any = True
             logger.warning(
@@ -1808,6 +2131,31 @@ def _ensure_native_tool_arguments(
             function.get("name") or "?",
             str(arguments)[:200],
         )
+        try:
+            _log_unrepairable_arguments(function.get("name") or "?", str(arguments))
+        except Exception:
+            pass
+        try:
+            import time as _drop_time
+            _dump_path = "/tmp/trae2api-drop-%d.json" % int(_drop_time.time() * 1000)
+            with open(_dump_path, "w", encoding="utf-8") as _dump_file:
+                json.dump(calls, _dump_file, ensure_ascii=False)
+            logger.warning("[tool-drop-dump] %s", _dump_path)
+        except Exception:
+            pass
+        try:
+            logger.warning(
+                "[tool-drop-siblings] %s",
+                [
+                    (
+                        str((item.get("function") or {}).get("name") or "?"),
+                        str((item.get("function") or {}).get("arguments") or "")[:60],
+                    )
+                    for item in calls
+                ],
+            )
+        except Exception:
+            pass
         repaired_any = True
         if strict:
             raise InvalidNativeToolArguments(
@@ -2595,6 +2943,7 @@ async def translate_ide_stream(
             final_usage,
             strict=True,
             url_hints=url_hints,
+            finish_reason=final_reason,
         )
     )
     if reasoning_summary:
@@ -3919,6 +4268,7 @@ async def collect_nonstream_ide(
             usage,
             strict=True,
             url_hints=url_hints,
+            finish_reason=finish_reason,
         )
     )
     if not full.strip() and not tool_calls.has_calls and saw_completed_repeat:
