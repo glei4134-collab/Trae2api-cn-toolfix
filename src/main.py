@@ -4994,10 +4994,56 @@ async def _deferred_dispatch_stream(
             )
 
 
+def _maybe_enable_completion_contract(
+    messages: list[dict], options: dict
+) -> dict:
+    """Add the synthetic completion tool for agentic tool conversations."""
+
+    if not continuation.completion_contract_enabled():
+        return options
+    options = options or {}
+    if options.get("_traework_custom_model"):
+        return options
+    choice = options.get("tool_choice")
+    choice_text = str(choice or "").strip().lower()
+    if choice_text in {"none", "required"} or isinstance(choice, Mapping):
+        return options
+    tools = options.get("tools") or options.get("functions")
+    if not isinstance(tools, list) or not tools:
+        return options
+    agentic = any(
+        str(message.get("role") or "").strip().lower() in {"tool", "function"}
+        for message in messages
+        if isinstance(message, Mapping)
+    )
+    if not agentic:
+        return options
+    tools_list = list(tools)
+    already = any(
+        str(
+            ((tool.get("function") or {}).get("name") if isinstance(tool, Mapping) else "")
+            or ""
+        )
+        == continuation.COMPLETION_TOOL_NAME
+        for tool in tools_list
+    )
+    if not already:
+        tools_list.append(
+            json.loads(json.dumps(continuation.COMPLETION_TOOL_SPEC))
+        )
+    options = dict(options)
+    options["tools"] = tools_list
+    options["_completion_contract"] = True
+    return options
+
+
 def _continuation_allowed(options: Optional[Mapping[str, Any]]) -> bool:
     """Whether this request may transparently continue a truncated answer."""
 
-    if not (continuation.enabled() or continuation.intent_enabled()):
+    if not (
+        continuation.enabled()
+        or continuation.completion_contract_enabled()
+    ):
         return False
     options = options or {}
     if options.get("_disable_auto_continue"):
@@ -5027,25 +5073,20 @@ async def _stream_with_continuation(
     truncation_limit = (
         continuation.max_continues() if continuation.enabled() else 0
     )
-    intent_limit = (
-        continuation.intent_max_continues()
-        if continuation.intent_enabled()
+    completion_limit = (
+        continuation.completion_max_continues()
+        if continuation.completion_contract_enabled()
         else 0
     )
-    limit = max(truncation_limit, intent_limit)
+    limit = max(truncation_limit, completion_limit)
     if not _continuation_allowed(options) or limit <= 0:
         async for chunk in first_response:
             yield chunk
         return
 
     truncation_rounds = 0
-    intent_rounds = 0
-    has_tools = bool((options or {}).get("tools") or (options or {}).get("functions"))
-    agentic = any(
-        str(message.get("role") or "").strip().lower() in {"tool", "function"}
-        for message in messages
-        if isinstance(message, Mapping)
-    )
+    completion_rounds = 0
+    contract_enabled = bool((options or {}).get("_completion_contract"))
     threshold = continuation.text_threshold()
     similarity_limit = continuation.similarity_threshold()
     current_messages = list(messages)
@@ -5085,9 +5126,21 @@ async def _stream_with_continuation(
         round_text = ""
         round_reasoning = ""
         saw_tool_call = False
+        completion_seen = False
+        completion_summary = ""
         finish_reason = "stop"
         async for raw_chunk in current_response:
             for chunk in complete_blocks(raw_chunk):
+                if contract_enabled:
+                    chunk, found, summary = _strip_completion_tool_calls(
+                        chunk, continuation.COMPLETION_TOOL_NAME
+                    )
+                    if found:
+                        completion_seen = True
+                        if summary:
+                            completion_summary = summary
+                    if not chunk:
+                        continue
                 parsed = _chunk_finish_reason(chunk)
                 if parsed:
                     finish_reason = parsed
@@ -5107,6 +5160,16 @@ async def _stream_with_continuation(
         # Flush a final non-blank fragment for upstreams that close without a
         # blank-line delimiter. A terminal [DONE] block is always delimited.
         for chunk in complete_blocks("", flush=True):
+            if contract_enabled:
+                chunk, found, summary = _strip_completion_tool_calls(
+                    chunk, continuation.COMPLETION_TOOL_NAME
+                )
+                if found:
+                    completion_seen = True
+                    if summary:
+                        completion_summary = summary
+                if not chunk:
+                    continue
             parsed = _chunk_finish_reason(chunk)
             if parsed:
                 finish_reason = parsed
@@ -5122,6 +5185,19 @@ async def _stream_with_continuation(
 
         text_total += round_text
         reasoning_total += round_reasoning
+        if contract_enabled and completion_seen and not saw_tool_call:
+            # The model ended through the synthetic completion tool: strip it
+            # and close the public response as a normal stop.
+            if completion_summary and not round_text.strip():
+                round_text += completion_summary
+                text_total += completion_summary
+                yield _completion_summary_chunk(model, completion_summary)
+            finish_reason = "stop"
+            finish_chunks = [
+                _finish_chunk_with_reason(chunk, "stop")
+                for chunk in finish_chunks
+            ]
+            break
         truncated = (
             truncation_rounds < truncation_limit
             and continuation.looks_truncated(
@@ -5139,19 +5215,26 @@ async def _stream_with_continuation(
                 reasoning=round_reasoning,
             )
         )
-        intent_only = (
-            intent_rounds < intent_limit
-            and has_tools
+        incomplete = (
+            contract_enabled
+            and completion_rounds < completion_limit
             and not truncated
             and not reasoning_only
-            and continuation.looks_intent_only(
-                text_total,
-                finish_reason,
-                has_tool_calls=saw_tool_call,
-                agentic=agentic,
-            )
+            and not saw_tool_call
+            and str(finish_reason or "").strip().lower()
+            not in {
+                "length",
+                "max_tokens",
+                "max_output_tokens",
+                "token_limit",
+                "context_length_exceeded",
+                "model_context_window_exceeded",
+                "tool_calls",
+                "tool_use",
+                "function_call",
+            }
         )
-        if not truncated and not reasoning_only and not intent_only:
+        if not truncated and not reasoning_only and not incomplete:
             break
         if attempt >= limit:
             logger.info(
@@ -5177,12 +5260,12 @@ async def _stream_with_continuation(
             last_short_text = current_text
 
         continue_reason = (
-            "intent-only"
-            if intent_only
+            "completion-missing"
+            if incomplete
             else ("reasoning-only" if reasoning_only else "truncated")
         )
-        if intent_only:
-            intent_rounds += 1
+        if incomplete:
+            completion_rounds += 1
         else:
             truncation_rounds += 1
         logger.info(
@@ -5202,7 +5285,7 @@ async def _stream_with_continuation(
             messages,
             text_total,
             reasoning_only=reasoning_only,
-            intent_only=intent_only,
+            completion_contract=incomplete,
         )
         # Re-enter the deferred dispatcher so a continuation round keeps the
         # same endpoint fallback and pre-output retry guarantees as the first
@@ -5496,6 +5579,125 @@ def _chunk_has_tool_calls(chunk: Any) -> bool:
             if isinstance(delta, Mapping) and delta.get("tool_calls"):
                 return True
     return False
+
+
+def _strip_completion_tool_calls(
+    chunk: Any, completion_name: str
+) -> tuple[str, bool, str]:
+    """Remove synthetic completion calls from one Chat SSE chunk.
+
+    Returns ``(cleaned_chunk, found, summary)``.  The translator emits one
+    complete tool call per chunk, so dropping the chunk never truncates a
+    client tool call that is still streaming its arguments.
+    """
+
+    try:
+        payloads = list(_iter_sse_payloads(chunk))
+    except Exception:
+        return chunk, False, ""
+    if not payloads:
+        return chunk, False, ""
+    found = False
+    summary = ""
+    rebuilt_values: list[dict] = []
+    for value in payloads:
+        if not isinstance(value, dict):
+            continue
+        choices = value.get("choices")
+        if not isinstance(choices, list):
+            rebuilt_values.append(value)
+            continue
+        new_choices: list[Any] = []
+        for choice in choices:
+            if not isinstance(choice, Mapping):
+                new_choices.append(choice)
+                continue
+            delta = choice.get("delta")
+            calls = delta.get("tool_calls") if isinstance(delta, Mapping) else None
+            if not isinstance(calls, list):
+                new_choices.append(choice)
+                continue
+            kept: list[Any] = []
+            for call in calls:
+                function = call.get("function") if isinstance(call, Mapping) else None
+                name = str((function or {}).get("name") or "")
+                if name != completion_name:
+                    kept.append(call)
+                    continue
+                found = True
+                arguments = (function or {}).get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        parsed = json.loads(arguments)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, Mapping) and isinstance(
+                        parsed.get("summary"), str
+                    ):
+                        summary = parsed["summary"]
+            if len(kept) == len(calls):
+                new_choices.append(choice)
+                continue
+            if not kept:
+                continue
+            new_choice = dict(choice)
+            new_delta = dict(delta)
+            new_delta["tool_calls"] = kept
+            new_choice["delta"] = new_delta
+            new_choices.append(new_choice)
+        if not new_choices:
+            continue
+        new_value = dict(value)
+        new_value["choices"] = new_choices
+        rebuilt_values.append(new_value)
+    if not found:
+        return chunk, False, ""
+    if not rebuilt_values:
+        return "", True, summary
+    rebuilt = "".join(
+        "data: " + json.dumps(value, ensure_ascii=False) + "\n\n"
+        for value in rebuilt_values
+    )
+    return rebuilt, True, summary
+
+
+def _finish_chunk_with_reason(chunk: Any, reason: str) -> str:
+    """Rewrite a held finish chunk to a different finish reason."""
+
+    rebuilt: list[str] = []
+    for value in _iter_sse_payloads(chunk):
+        if not isinstance(value, dict):
+            continue
+        choices = value.get("choices")
+        if isinstance(choices, list):
+            for choice in choices:
+                if isinstance(choice, dict) and choice.get("finish_reason"):
+                    choice["finish_reason"] = reason
+        rebuilt.append("data: " + json.dumps(value, ensure_ascii=False) + "\n\n")
+    return "".join(rebuilt) if rebuilt else chunk
+
+
+def _completion_summary_chunk(model: str, text: str) -> str:
+    return (
+        "data: "
+        + json.dumps(
+            {
+                "id": "",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": text},
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
 
 
 def _iter_sse_payloads(chunk: Any):
@@ -13455,6 +13657,7 @@ async def handle_chat(req: Request):
         options,
         requested_session_id=requested_session_id,
     )
+    options = _maybe_enable_completion_contract(messages, options)
     tracker = _UsageTracker(model, req.url.path, stream, options, messages)
     tracker.request_id = request_id
     options["_relay_request_id"] = request_id
@@ -13547,6 +13750,7 @@ async def handle_responses(req: Request):
         options,
         requested_session_id=str(options.get("session_id") or options.get("sessionId") or ""),
     )
+    options = _maybe_enable_completion_contract(messages, options)
     stream = bool(body.get("stream", False))
     tracker = _UsageTracker(context.model, req.url.path, stream, options, messages)
     tracker.request_id = request_id

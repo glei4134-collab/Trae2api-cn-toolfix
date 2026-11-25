@@ -2892,6 +2892,16 @@ def build_runtime_system_prompt(
             "call the matching client tool in that same turn and keep working until "
             "the user's request is complete."
         )
+        if any(
+            str(tool.get("name") or "").strip() == "relay_task_complete"
+            for tool in tool_defs
+        ):
+            lines.append(
+                "When the user's request is fully complete and verified, call "
+                "relay_task_complete with a short summary. Until then keep calling "
+                "client tools to make progress; never end a turn with only an "
+                "announcement or a plan."
+            )
         shell_names = {"pwsh", "powershell", "bash", "shell", "terminal", "cmd"}
         if any(
             str(tool.get("name") or "").strip().lower() in shell_names
