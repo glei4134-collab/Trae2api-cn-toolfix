@@ -45,7 +45,8 @@ INTENT_CONTINUE_INSTRUCTION = (
 
 _DEFAULT_INTENT_MAX_CONTINUES = 1
 _INTENT_ACTION_RE = re.compile(
-    r"^(?:现在|接下来|下一步|下面|然后|接着|马上|立即|这就|我先|我来|先|再|随后)"
+    r"^(?:现在|接下来|下一步|下面|然后|接着|马上|立即|这就|我先|我来|先|再|随后|"
+    r"同时|另外|还要|还需|最后|之后|顺手|顺便|并)"
     r"[^。！？!?\n]{0,80}?"
     r"(?:查|查看|检查|看|读|读取|写|编写|改|修改|修|修复|补|填|加上|添加|设置|"
     r"配置|调整|替换|移除|删除|运行|跑|执行|验证|测试|创建|新建|更新|生成|整理|"
@@ -306,7 +307,7 @@ def looks_intent_only(
     return bool(
         agentic
         and len(body) <= 160
-        and not _INTENT_DONE_HINT_RE.search(body)
+        and not _INTENT_DONE_HINT_RE.search(last)
         and not re.match(r"^(?:请|建议|需要|如果|若)", body)
     )
 

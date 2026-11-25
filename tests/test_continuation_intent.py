@@ -54,6 +54,7 @@ class IntentDetectionTests(unittest.TestCase):
             "现在编写最终文档。",
             "`poster` 和 `loop_motion` 这两个模板各有一个占位符没有默认值。现在给它们补上默认值。",
             "#connLabel 这个 ID 并不存在。先查清真实 ID，再运行测试。",
+            "真实端点 Range 完全正常，HEAD 返回 405 需要修。同时修 `probe_video_size` 的 duration 恒为 None 问题。",
             "Now I'll fix the test script.",
         ]
         for text in cases:
