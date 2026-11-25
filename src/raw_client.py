@@ -2886,6 +2886,12 @@ def build_runtime_system_prompt(
             "required field and concrete values. An argument error is never evidence "
             "that the tool or the environment is unavailable."
         )
+        lines.append(
+            "Never end a turn by only announcing the next action. If your reply "
+            "says you will now check, fix, write, run, create, or verify something, "
+            "call the matching client tool in that same turn and keep working until "
+            "the user's request is complete."
+        )
         shell_names = {"pwsh", "powershell", "bash", "shell", "terminal", "cmd"}
         if any(
             str(tool.get("name") or "").strip().lower() in shell_names
