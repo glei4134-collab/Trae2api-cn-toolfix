@@ -38,6 +38,44 @@ REASONING_ONLY_INSTRUCTION = (
     "Your previous response contained only thinking/reasoning with no actual "
     "output. Provide the actual response now - either text content or a tool call."
 )
+INTENT_CONTINUE_INSTRUCTION = (
+    "你上一条消息只声明了下一步要做什么，但没有调用任何工具。"
+    "请立即实际执行：直接调用相应工具完成该动作，不要再次只回复计划或说明。"
+)
+
+_DEFAULT_INTENT_MAX_CONTINUES = 1
+_INTENT_ACTION_RE = re.compile(
+    r"^(?:现在|接下来|下一步|下面|然后|接着|马上|立即|这就|我先|我来|先|再|随后)"
+    r"[^。！？!?\n]{0,80}?"
+    r"(?:查|查看|检查|看|读|读取|写|编写|改|修改|修|修复|补|填|加上|添加|设置|"
+    r"配置|调整|替换|移除|删除|运行|跑|执行|验证|测试|创建|新建|更新|生成|整理|"
+    r"搜索|查找|实现|定位|分析|处理|继续|重跑|试|保存|提交|推送|部署|安装|重启|"
+    r"启动|拉取|克隆|下载|上传|同步|刷新|合并|拆分|重构|优化|格式化|导入|导出|"
+    r"绑定|注册|登录|连接|打开|关闭|切换|编译|打包|发布|回滚)"
+)
+_INTENT_BARE_ACTION_RE = re.compile(
+    r"^(?:修正|修复|编写|更新|修改|运行|执行|创建|生成|添加|删除|检查|验证|测试|"
+    r"继续|重新|补全|补齐|补上|填入|填写|设置|配置|调整|替换|移除|保存|提交|推送|"
+    r"部署|安装|重启|启动|重跑|实现|重写|完善|整理|同步|刷新|合并|拆分|重构|优化|"
+    r"格式化|导入|导出|编译|打包|发布|绑定|注册|登录|连接|打开|关闭|切换)"
+    r"[^，,。！？!?\n]{0,60}$"
+)
+_INTENT_FINISHED_RE = re.compile(
+    r"(?:已经|已|完成|搞定|结束|可以|就好了|没问题|不需要|无需|[了啦]\s*$)"
+)
+_INTENT_USER_RE = re.compile(r"你(?:可以|需要|应该|要|自己)")
+_INTENT_EN_RE = re.compile(
+    r"^(?:now|next|then|let me|i'll|i will)\b[^.!?\n]{0,120}"
+    r"(?:check|read|write|edit|fix|run|test|verify|create|update|generate|"
+    r"search|find|implement|continue|try|look)",
+    re.IGNORECASE,
+)
+_INTENT_DONE_HINT_RE = re.compile(
+    r"(?:已|完成|完毕|正常|成功|通过|失败|错误|报告|总结|等待|稍等|了|啦|"
+    r"你(?:可以|需要|应该|要)|done|complete|completed|finished|fixed|updated|"
+    r"added|changed|works|passing)",
+    re.IGNORECASE,
+)
 
 # Trailing characters that prove the model stopped mid-token/structure.
 _TRUNCATED_ENDINGS = (
@@ -88,6 +126,18 @@ def enabled() -> bool:
 
 def max_continues() -> int:
     return _env_int("TRAE_AUTO_CONTINUE_MAX", _DEFAULT_MAX_CONTINUES, 0)
+
+
+def intent_enabled() -> bool:
+    """Whether an intent-only ending may be continued with one nudge."""
+
+    return _env_flag("TRAE_AUTO_CONTINUE_ON_INTENT", False)
+
+
+def intent_max_continues() -> int:
+    return _env_int(
+        "TRAE_AUTO_CONTINUE_ON_INTENT_MAX", _DEFAULT_INTENT_MAX_CONTINUES, 0
+    )
 
 
 def text_threshold() -> int:
@@ -208,6 +258,59 @@ def looks_truncated(
     return _stopped_after_thinking(body, reasoning)
 
 
+def looks_intent_only(
+    text: str,
+    finish_reason: Optional[str] = None,
+    *,
+    has_tool_calls: bool = False,
+    agentic: bool = False,
+) -> bool:
+    """Whether a finished turn only announced the next action.
+
+    Tool turns are never continued.  Length stops belong to the truncation
+    helper and must not be double-counted here.
+    """
+
+    if has_tool_calls:
+        return False
+    reason = str(finish_reason or "").strip().lower()
+    if reason in _LENGTH_FINISH_REASONS:
+        return False
+    if reason in {"tool_calls", "tool_use", "function_call"}:
+        return False
+    body = str(text or "").strip()
+    if not body or len(body) > 500:
+        return False
+    sentences = [
+        part.strip() for part in re.split(r"[\n。！？!?]+", body) if part.strip()
+    ]
+    last = sentences[-1] if sentences else body
+    if not last:
+        return False
+    if _INTENT_FINISHED_RE.search(last) or _INTENT_USER_RE.search(last):
+        return False
+    if (
+        _INTENT_ACTION_RE.search(last)
+        or _INTENT_BARE_ACTION_RE.search(last)
+        or _INTENT_EN_RE.search(last)
+    ):
+        return True
+    last_clause = re.split(r"[，,；;]", last)[-1].strip()
+    if last_clause and (
+        _INTENT_ACTION_RE.search(last_clause)
+        or _INTENT_BARE_ACTION_RE.search(last_clause)
+    ):
+        return True
+    # Fallback for phrasings the verb list cannot cover: a short ending in a
+    # conversation that already used tools, without any completion marker.
+    return bool(
+        agentic
+        and len(body) <= 160
+        and not _INTENT_DONE_HINT_RE.search(body)
+        and not re.match(r"^(?:请|建议|需要|如果|若)", body)
+    )
+
+
 def looks_reasoning_only(
     text: str, *, has_tool_calls: bool = False, reasoning: str = ""
 ) -> bool:
@@ -221,6 +324,7 @@ def continued_messages(
     partial_text: str,
     *,
     reasoning_only: bool = False,
+    intent_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Return the conversation for one continuation round.
 
@@ -234,6 +338,11 @@ def continued_messages(
     partial = (partial_text or "").strip()
     if partial:
         continued.append({"role": "assistant", "content": partial_text})
-    instruction = REASONING_ONLY_INSTRUCTION if reasoning_only else CONTINUE_INSTRUCTION
+    if intent_only:
+        instruction = INTENT_CONTINUE_INSTRUCTION
+    elif reasoning_only:
+        instruction = REASONING_ONLY_INSTRUCTION
+    else:
+        instruction = CONTINUE_INSTRUCTION
     continued.append({"role": "user", "content": instruction})
     return continued

@@ -4997,7 +4997,7 @@ async def _deferred_dispatch_stream(
 def _continuation_allowed(options: Optional[Mapping[str, Any]]) -> bool:
     """Whether this request may transparently continue a truncated answer."""
 
-    if not continuation.enabled():
+    if not (continuation.enabled() or continuation.intent_enabled()):
         return False
     options = options or {}
     if options.get("_disable_auto_continue"):
@@ -5024,12 +5024,28 @@ async def _stream_with_continuation(
     duplicated or unbounded answer.
     """
 
-    limit = continuation.max_continues()
+    truncation_limit = (
+        continuation.max_continues() if continuation.enabled() else 0
+    )
+    intent_limit = (
+        continuation.intent_max_continues()
+        if continuation.intent_enabled()
+        else 0
+    )
+    limit = max(truncation_limit, intent_limit)
     if not _continuation_allowed(options) or limit <= 0:
         async for chunk in first_response:
             yield chunk
         return
 
+    truncation_rounds = 0
+    intent_rounds = 0
+    has_tools = bool((options or {}).get("tools") or (options or {}).get("functions"))
+    agentic = any(
+        str(message.get("role") or "").strip().lower() in {"tool", "function"}
+        for message in messages
+        if isinstance(message, Mapping)
+    )
     threshold = continuation.text_threshold()
     similarity_limit = continuation.similarity_threshold()
     current_messages = list(messages)
@@ -5106,18 +5122,36 @@ async def _stream_with_continuation(
 
         text_total += round_text
         reasoning_total += round_reasoning
-        truncated = continuation.looks_truncated(
-            text_total,
-            finish_reason,
-            has_tool_calls=saw_tool_call,
-            reasoning=round_reasoning,
+        truncated = (
+            truncation_rounds < truncation_limit
+            and continuation.looks_truncated(
+                text_total,
+                finish_reason,
+                has_tool_calls=saw_tool_call,
+                reasoning=round_reasoning,
+            )
         )
-        reasoning_only = continuation.looks_reasoning_only(
-            round_text,
-            has_tool_calls=saw_tool_call,
-            reasoning=round_reasoning,
+        reasoning_only = (
+            truncation_rounds < truncation_limit
+            and continuation.looks_reasoning_only(
+                round_text,
+                has_tool_calls=saw_tool_call,
+                reasoning=round_reasoning,
+            )
         )
-        if not truncated and not reasoning_only:
+        intent_only = (
+            intent_rounds < intent_limit
+            and has_tools
+            and not truncated
+            and not reasoning_only
+            and continuation.looks_intent_only(
+                text_total,
+                finish_reason,
+                has_tool_calls=saw_tool_call,
+                agentic=agentic,
+            )
+        )
+        if not truncated and not reasoning_only and not intent_only:
             break
         if attempt >= limit:
             logger.info(
@@ -5142,12 +5176,21 @@ async def _stream_with_continuation(
         if len(current_text) < threshold:
             last_short_text = current_text
 
+        continue_reason = (
+            "intent-only"
+            if intent_only
+            else ("reasoning-only" if reasoning_only else "truncated")
+        )
+        if intent_only:
+            intent_rounds += 1
+        else:
+            truncation_rounds += 1
         logger.info(
             "auto-continue round=%d id=%s model=%s reason=%s finish=%s chars=%d",
             attempt + 1,
             request_id,
             model,
-            "reasoning-only" if reasoning_only else "truncated",
+            continue_reason,
             finish_reason,
             len(round_text),
         )
@@ -5156,7 +5199,10 @@ async def _stream_with_continuation(
         if callable(bind_rounds):
             bind_rounds(attempt + 1)
         current_messages = continuation.continued_messages(
-            messages, text_total, reasoning_only=reasoning_only
+            messages,
+            text_total,
+            reasoning_only=reasoning_only,
+            intent_only=intent_only,
         )
         # Re-enter the deferred dispatcher so a continuation round keeps the
         # same endpoint fallback and pre-output retry guarantees as the first
@@ -13433,7 +13479,12 @@ async def handle_chat(req: Request):
         return StreamingResponse(
             _tracked_stream(
                 _lease_stream(
-                    _deferred_dispatch_stream(messages, model, options),
+                    _stream_with_continuation(
+                        messages,
+                        model,
+                        options,
+                        _deferred_dispatch_stream(messages, model, options),
+                    ),
                     session_id,
                 ),
                 tracker,
@@ -13522,7 +13573,14 @@ async def handle_responses(req: Request):
             _tracked_stream(
                 _lease_stream(
                     responses_api.translate_chat_stream(
-                        _deferred_dispatch_stream(messages, context.model, options),
+                        _stream_with_continuation(
+                            messages,
+                            context.model,
+                            options,
+                            _deferred_dispatch_stream(
+                                messages, context.model, options
+                            ),
+                        ),
                         context,
                     ),
                     session_id,
