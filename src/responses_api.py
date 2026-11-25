@@ -760,6 +760,51 @@ def _inert_tool_output_message(
     }
 
 
+def _responses_content_parts(content: Any) -> Optional[list[dict[str, Any]]]:
+    """Preserve Responses ``input_image`` parts instead of flattening them."""
+
+    if not isinstance(content, list):
+        return None
+    parts: list[dict[str, Any]] = []
+    has_image = False
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                parts.append({"type": "text", "text": part})
+            continue
+        if not isinstance(part, Mapping):
+            text = str(part)
+            if text:
+                parts.append({"type": "text", "text": text})
+            continue
+        part_type = str(part.get("type") or "").strip().lower()
+        if part_type in ("input_text", "text"):
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                parts.append({"type": "text", "text": text})
+            continue
+        if part_type == "input_image":
+            image_url = part.get("image_url")
+            if isinstance(image_url, Mapping):
+                image_url = image_url.get("url")
+            image_url = str(image_url or "").strip()
+            if image_url:
+                parts.append(
+                    {"type": "image_url", "image_url": {"url": image_url}}
+                )
+                has_image = True
+            else:
+                parts.append({"type": "text", "text": "[image file_id omitted]"})
+            continue
+        if part_type == "input_file":
+            parts.append({"type": "text", "text": "[file input omitted]"})
+            continue
+        text = _content_to_text([part])
+        if text:
+            parts.append({"type": "text", "text": text})
+    return parts if has_image else None
+
+
 def _append_message_item(messages: list[dict[str, Any]], item: Mapping[str, Any]) -> None:
     role = str(item.get("role") or "user")
     if role not in ("system", "developer", "user", "assistant"):
@@ -776,8 +821,10 @@ def _append_message_item(messages: list[dict[str, Any]], item: Mapping[str, Any]
                 content = candidate
                 break
     text = _content_to_text(content)
-    if text or role in ("user", "assistant"):
-        message = {"role": role, "content": text}
+    image_content = _responses_content_parts(content)
+    message_content: Any = image_content if image_content is not None else text
+    if message_content or role in ("user", "assistant"):
+        message = {"role": role, "content": message_content}
         if role == "assistant" and item.get("phase"):
             message["phase"] = item.get("phase")
         if role == "assistant":
