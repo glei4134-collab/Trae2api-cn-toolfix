@@ -1842,6 +1842,105 @@ _HEADLESS_PATH_TOOLS = {
 }
 
 
+def _first_string_argument_keys(tools: Any) -> dict[str, str]:
+    """Map each tool name to its first schema-declared string argument."""
+
+    if isinstance(tools, dict):
+        tools = list(tools.values())
+    if not isinstance(tools, list):
+        return {}
+    keys: dict[str, str] = {}
+    for tool in tools:
+        if not isinstance(tool, Mapping):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), Mapping) else tool
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        schema = (
+            function.get("parameters")
+            or function.get("input_schema")
+            or tool.get("parameters")
+            or tool.get("input_schema")
+        )
+        if not isinstance(schema, Mapping):
+            continue
+        properties = schema.get("properties")
+        if not isinstance(properties, Mapping):
+            continue
+        required = schema.get("required")
+        candidates: list[str] = []
+        if isinstance(required, list):
+            candidates.extend(str(item) for item in required)
+        candidates.extend(str(item) for item in properties.keys())
+        for key in candidates:
+            spec = properties.get(key)
+            if not isinstance(spec, Mapping):
+                continue
+            declared = spec.get("type")
+            if declared == "string" or (
+                isinstance(declared, list) and "string" in declared
+            ):
+                keys[name] = key
+                break
+    return keys
+
+
+def _recover_orphan_tool_arguments(
+    name: Any, arguments: Any, first_key: str
+) -> str:
+    """Rebuild an argument tail that lost its ``{"<key>": "`` prefix.
+
+    Trae's native delta stream can deliver one call's arguments starting in the
+    middle of the first string value (observed with parallel ``grep`` calls).
+    For read-only tools the schema tells us the first string parameter, so the
+    prefix can be restored instead of failing the whole turn.
+    """
+
+    tool_name = str(name or "").strip()
+    if not tool_name or not first_key or _is_mutating_tool(tool_name):
+        return ""
+    text = str(arguments or "").strip()
+    if not text or text[:1] in ("{", "["):
+        return ""
+    # A genuine mid-string tail always carries the value's closing quote and
+    # usually the next key.  Fragments without any quote are plain garbage and
+    # must stay dropped.
+    if '"' not in text:
+        return ""
+    # ``text`` starts inside the first string value, so restore the opening
+    # quote as well; any missing tail is closed by ``_repair_json_arguments``.
+    candidate = '{"' + first_key + '": "' + text
+    repaired = _repair_json_arguments(candidate)
+    try:
+        parsed = json.loads(repaired)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(parsed, dict) or not isinstance(parsed.get(first_key), str):
+        return ""
+    if not parsed[first_key].strip():
+        return ""
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+def _dump_tool_frames(payload: Any) -> None:
+    """Append raw upstream tool frames when opt-in diagnosis is on."""
+
+    if os.environ.get("TRAE_DUMP_TOOL_FRAMES", "").strip().lower() not in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
+    try:
+        path = "/tmp/trae2api-toolframes-%d.jsonl" % os.getpid()
+        with open(path, "a", encoding="utf-8") as dump_file:
+            dump_file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def _recover_headless_path_arguments(name: Any, arguments: Any) -> str:
     """Rebuild a path-only argument tail whose JSON prefix was lost.
 
@@ -1974,11 +2073,15 @@ def _ensure_native_tool_arguments(
     strict: bool = False,
     url_hints: Optional[list[str]] = None,
     finish_reason: Optional[str] = None,
+    tools: Any = None,
 ) -> list[dict]:
     """Validate/repair/split malformed native delta tool arguments."""
     calls = _merge_split_argument_fragments(calls)
     repaired_any = False
     kept: list[dict] = []
+    first_string_keys = _first_string_argument_keys(tools)
+    first_dropped_name = ""
+    dropped_any = False
     for call in calls:
         function = call.get("function") or {}
         arguments = function.get("arguments")
@@ -2122,6 +2225,22 @@ def _ensure_native_tool_arguments(
             )
             kept.append(call)
             continue
+        recovered_orphan = _recover_orphan_tool_arguments(
+            function.get("name"),
+            arguments,
+            first_string_keys.get(str(function.get("name") or "").strip(), ""),
+        )
+        if recovered_orphan:
+            function["arguments"] = recovered_orphan
+            repaired_any = True
+            logger.warning(
+                "[repair-orphan] call=%s %r -> %s",
+                function.get("name") or "?",
+                str(arguments)[:80],
+                recovered_orphan[:120],
+            )
+            kept.append(call)
+            continue
         stripped = arguments.strip()
         if stripped in ("}", "]", "", "{}", "[]"):
             logger.warning("[drop] orphan closing fragment %r", stripped[:30])
@@ -2157,14 +2276,36 @@ def _ensure_native_tool_arguments(
         except Exception:
             pass
         repaired_any = True
-        if strict:
+        dropped_any = True
+        dropped_name = str(function.get("name") or "?")
+        if not first_dropped_name:
+            first_dropped_name = dropped_name
+        if (
+            strict
+            and _is_mutating_tool(function.get("name"))
+            and str(finish_reason or "").lower() == "length"
+        ):
+            # Never execute a command that was cut off by the token limit.
             raise InvalidNativeToolArguments(
                 "Trae upstream returned invalid JSON arguments for tool "
-                f"{function.get('name') or '?'}",
+                f"{dropped_name}",
                 retryable=False,
                 usage=usage,
                 observed_model_event=True,
             )
+        if strict:
+            logger.warning(
+                "[tool-drop-continue] call=%s dropped; keeping other calls",
+                dropped_name,
+            )
+    if strict and dropped_any and not kept:
+        raise InvalidNativeToolArguments(
+            "Trae upstream returned invalid JSON arguments for tool "
+            f"{first_dropped_name or '?'}",
+            retryable=False,
+            usage=usage,
+            observed_model_event=True,
+        )
     if repaired_any:
         logger.warning("[repair] repaired/split/dropped unusable tool call(s) this turn")
     return kept
@@ -2840,6 +2981,8 @@ async def translate_ide_stream(
             reasoning_calls.extend(embedded_calls)
         response_delta, response_calls = response_text.add(visible_response)
         calls = _calls_from_payload(obj)
+        if calls:
+            _dump_tool_frames(obj)
         calls.extend(reasoning_calls)
         calls.extend(response_calls)
         if _contains_completed_tool_repeat(calls, completed_tool_signatures):
@@ -2944,6 +3087,7 @@ async def translate_ide_stream(
             strict=True,
             url_hints=url_hints,
             finish_reason=final_reason,
+            tools=allowed_tools,
         )
     )
     if reasoning_summary:
@@ -4194,6 +4338,8 @@ async def collect_nonstream_ide(
             reasoning_calls.extend(embedded_calls)
         response_delta, response_calls = response_text.add(visible_response)
         calls = _calls_from_payload(obj)
+        if calls:
+            _dump_tool_frames(obj)
         calls.extend(reasoning_calls)
         calls.extend(response_calls)
         if _contains_completed_tool_repeat(calls, completed_tool_signatures):
@@ -4269,6 +4415,7 @@ async def collect_nonstream_ide(
             strict=True,
             url_hints=url_hints,
             finish_reason=finish_reason,
+            tools=allowed_tools,
         )
     )
     if not full.strip() and not tool_calls.has_calls and saw_completed_repeat:
