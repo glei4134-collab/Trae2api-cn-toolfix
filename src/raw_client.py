@@ -2902,6 +2902,11 @@ def build_runtime_system_prompt(
                 "client tools to make progress; never end a turn with only an "
                 "announcement or a plan."
             )
+        lines.append(
+            "If you notice yourself repeating the same sentence or phrase, stop "
+            "immediately: call a tool or give a short summary instead of "
+            "continuing the repetition."
+        )
         shell_names = {"pwsh", "powershell", "bash", "shell", "terminal", "cmd"}
         if any(
             str(tool.get("name") or "").strip().lower() in shell_names

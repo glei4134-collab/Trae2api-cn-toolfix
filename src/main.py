@@ -5043,6 +5043,7 @@ def _continuation_allowed(options: Optional[Mapping[str, Any]]) -> bool:
     if not (
         continuation.enabled()
         or continuation.completion_contract_enabled()
+        or continuation.repeat_guard_enabled()
     ):
         return False
     options = options or {}
@@ -5079,6 +5080,8 @@ async def _stream_with_continuation(
         else 0
     )
     limit = max(truncation_limit, completion_limit)
+    if continuation.repeat_guard_enabled():
+        limit = max(limit, 1)
     if not _continuation_allowed(options) or limit <= 0:
         async for chunk in first_response:
             yield chunk
@@ -5129,6 +5132,13 @@ async def _stream_with_continuation(
         completion_seen = False
         completion_summary = ""
         finish_reason = "stop"
+        guard = None
+        if continuation.repeat_guard_enabled():
+            guard = continuation.RepeatGuard(
+                continuation.repeat_guard_min_repeats(),
+                continuation.repeat_guard_max_unit(),
+            )
+        repeat_hit = False
         async for raw_chunk in current_response:
             for chunk in complete_blocks(raw_chunk):
                 if contract_enabled:
@@ -5153,9 +5163,28 @@ async def _stream_with_continuation(
                     # yielded above instead of being lost with the finish.
                     finish_chunks.append(chunk)
                     continue
-                round_text += _chunk_text_delta(chunk)
+                text_delta = _chunk_text_delta(chunk)
+                if (
+                    guard is not None
+                    and text_delta
+                    and not _chunk_has_tool_calls(chunk)
+                ):
+                    hit, repeats, unit = guard.feed(text_delta)
+                    if hit:
+                        repeat_hit = True
+                        logger.warning(
+                            "repeat-guard id=%s repeats=%d unit=%r chars=%d",
+                            request_id,
+                            repeats,
+                            unit,
+                            len(round_text) + len(text_delta),
+                        )
+                        break
+                round_text += text_delta
                 round_reasoning += _chunk_reasoning_delta(chunk)
                 yield chunk
+            if repeat_hit:
+                break
 
         # Flush a final non-blank fragment for upstreams that close without a
         # blank-line delimiter. A terminal [DONE] block is always delimited.
@@ -5179,9 +5208,37 @@ async def _stream_with_continuation(
             if state is not None:
                 finish_chunks.append(chunk)
                 continue
-            round_text += _chunk_text_delta(chunk)
+            text_delta = _chunk_text_delta(chunk)
+            if (
+                guard is not None
+                and text_delta
+                and not _chunk_has_tool_calls(chunk)
+            ):
+                hit, repeats, unit = guard.feed(text_delta)
+                if hit:
+                    repeat_hit = True
+                    logger.warning(
+                        "repeat-guard id=%s repeats=%d unit=%r chars=%d",
+                        request_id,
+                        repeats,
+                        unit,
+                        len(round_text) + len(text_delta),
+                    )
+                    break
+            round_text += text_delta
             round_reasoning += _chunk_reasoning_delta(chunk)
             yield chunk
+
+        if repeat_hit:
+            finish_reason = "stop"
+            finish_chunks = [_stream_error_event_free_finish(model)]
+            close = getattr(current_response, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:
+                    pass
+            break
 
         text_total += round_text
         reasoning_total += round_reasoning

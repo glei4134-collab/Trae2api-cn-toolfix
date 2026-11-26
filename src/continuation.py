@@ -131,6 +131,65 @@ def completion_max_continues() -> int:
     )
 
 
+def repeat_guard_enabled() -> bool:
+    """Whether a short phrase repeated at the stream tail aborts the answer."""
+
+    return _env_flag("TRAE_REPEAT_GUARD", False)
+
+
+def repeat_guard_min_repeats() -> int:
+    return _env_int("TRAE_REPEAT_GUARD_MIN_REPEATS", 12, 3)
+
+
+def repeat_guard_max_unit() -> int:
+    return _env_int("TRAE_REPEAT_GUARD_MAX_UNIT", 40, 4)
+
+
+def _meaningful_repeat_unit(unit: str) -> bool:
+    stripped = "".join(ch for ch in unit if not ch.isspace())
+    if len(stripped) < 2:
+        return False
+    if not any(ch.isalnum() or "\u4e00" <= ch <= "\u9fff" for ch in stripped):
+        return False
+    # Table separators, code fences, and pure markdown markers are not loops.
+    markers = set("-|=*#`>_~:")
+    return not all(ch in markers for ch in stripped)
+
+
+class RepeatGuard:
+    """Detect a short unit repeated many times at the tail of a text stream."""
+
+    def __init__(
+        self,
+        min_repeats: int = 12,
+        max_unit: int = 40,
+        window: int = 4000,
+    ) -> None:
+        self.min_repeats = max(3, int(min_repeats))
+        self.max_unit = max(4, int(max_unit))
+        self.window = max(window, self.max_unit * self.min_repeats)
+        self.buffer = ""
+
+    def feed(self, text: str) -> tuple[bool, int, str]:
+        if not text:
+            return False, 0, ""
+        self.buffer = (self.buffer + str(text))[-self.window :]
+        if len(self.buffer) < self.min_repeats * 2:
+            return False, 0, ""
+        for size in range(2, self.max_unit + 1):
+            unit = self.buffer[-size:]
+            if not _meaningful_repeat_unit(unit):
+                continue
+            repeats = 1
+            index = len(self.buffer) - size
+            while index >= size and self.buffer[index - size : index] == unit:
+                repeats += 1
+                index -= size
+            if repeats >= self.min_repeats:
+                return True, repeats, unit
+        return False, 0, ""
+
+
 def text_threshold() -> int:
     return _env_int(
         "TRAE_TRUNCATION_TEXT_THRESHOLD", _DEFAULT_TEXT_THRESHOLD, 1
