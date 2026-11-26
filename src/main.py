@@ -5231,12 +5231,18 @@ async def _stream_with_continuation(
 
         if repeat_hit:
             finish_reason = "stop"
-            finish_chunks = [_stream_error_event_free_finish(model)]
+            finish_chunks = [
+                _stream_error_event_free_finish(model),
+                "data: [DONE]\n\n",
+            ]
             close = getattr(current_response, "aclose", None)
             if callable(close):
                 try:
                     await close()
-                except Exception:
+                except BaseException:
+                    # Closing a suspended upstream read may surface as
+                    # CancelledError; the public stream still needs its
+                    # terminal finish/[DONE] frames.
                     pass
             break
 

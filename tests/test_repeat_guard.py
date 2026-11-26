@@ -90,6 +90,7 @@ class RepeatGuardStreamTests(unittest.IsolatedAsyncioTestCase):
             sum(1 for chunk in output if '"finish_reason": "stop"' in chunk),
             1,
         )
+        self.assertTrue(any("[DONE]" in chunk for chunk in output))
 
     async def test_normal_text_is_not_cut(self):
         chunks = [_text_chunk(f"第{i}段不同内容。") for i in range(30)]
